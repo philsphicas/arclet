@@ -182,7 +182,7 @@ fi
 # ---------- cleanup ----------
 test_ok=0
 arm_id=""
-# shellcheck disable=SC2317  # invoked indirectly via `trap cleanup EXIT`
+# shellcheck disable=SC2317,SC2329  # invoked indirectly via `trap cleanup EXIT`
 cleanup() {
     set +e
     log "cleanup phase"

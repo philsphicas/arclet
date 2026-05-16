@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: mfinelli/setup-shfmt@v3
+      - uses: mfinelli/setup-shfmt@v4
       - name: shfmt -d
         run: shfmt -d -i 4 -ci -bn .
 
@@ -49,7 +49,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: editorconfig-checker/action-editorconfig-checker@v3
+      - uses: editorconfig-checker/action-editorconfig-checker@v2
 
   gitleaks:
     name: gitleaks
@@ -75,7 +75,7 @@ jobs:
           load: true
           tags: arclet:ci
       - name: Trivy filesystem scan
-        uses: aquasecurity/trivy-action@0.34.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
           scan-ref: .
@@ -83,7 +83,7 @@ jobs:
           ignore-unfixed: true
           exit-code: "1"
       - name: Trivy image scan
-        uses: aquasecurity/trivy-action@0.34.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: arclet:ci
           severity: CRITICAL
