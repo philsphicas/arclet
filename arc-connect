@@ -1,0 +1,137 @@
+#!/bin/bash
+# Run once by systemd's arc-connect.service after himdsd is up.
+#
+# Idempotency: queries `azcmagent show -j` and short-circuits if already
+# connected to the expected resourceId with the same vmId. Otherwise
+# invokes `azcmagent connect existing`.
+
+set -euo pipefail
+
+log() { printf '[arc-connect] %s\n' "$*" >&2; }
+die() {
+    log "ERROR: $*"
+    exit 1
+}
+# Use die_permanent for errors that have NO chance of being fixed by a
+# retry (e.g., agent already enrolled against a different resource).
+# Exit code 2 is paired with RestartPreventExitStatus=2 in
+# arc-connect.service to stop systemd from spamming the same error 3x.
+die_permanent() {
+    log "ERROR: $*"
+    exit 2
+}
+
+ENV_FILE=/etc/arc-connect.env
+if [ ! -f "$ENV_FILE" ]; then
+    log "no $ENV_FILE present; nothing to do"
+    exit 0
+fi
+
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+
+# Validate required inputs.
+for v in ARC_SUBSCRIPTION_ID ARC_RESOURCE_GROUP ARC_RESOURCE_NAME \
+    ARC_LOCATION ARC_TENANT_ID ARC_VMID; do
+    if [ -z "${!v:-}" ]; then
+        die "missing required env var: $v"
+    fi
+done
+
+# Resolve the private key into a single base64 string for --private-key.
+if [ -n "${ARC_PRIVATE_KEY:-}" ]; then
+    arc_private_key="$ARC_PRIVATE_KEY"
+elif [ -n "${ARC_PRIVATE_KEY_FILE:-}" ]; then
+    [ -r "$ARC_PRIVATE_KEY_FILE" ] || die "ARC_PRIVATE_KEY_FILE=$ARC_PRIVATE_KEY_FILE not readable"
+    arc_private_key="$(tr -d '\r\n' <"$ARC_PRIVATE_KEY_FILE")"
+elif [ -r /run/secrets/arc_private_key ]; then
+    arc_private_key="$(tr -d '\r\n' </run/secrets/arc_private_key)"
+elif [ -r /etc/arc-container/private-key ]; then
+    arc_private_key="$(tr -d '\r\n' </etc/arc-container/private-key)"
+else
+    die "no Arc private key provided (set ARC_PRIVATE_KEY, ARC_PRIVATE_KEY_FILE, or mount /run/secrets/arc_private_key)"
+fi
+
+if ! printf '%s' "$arc_private_key" | base64 -d >/dev/null 2>&1; then
+    die "ARC_PRIVATE_KEY does not appear to be valid base64"
+fi
+
+arc_cloud="${ARC_CLOUD:-AzureCloud}"
+expected_resource_id="/subscriptions/${ARC_SUBSCRIPTION_ID}/resourceGroups/${ARC_RESOURCE_GROUP}/providers/Microsoft.HybridCompute/machines/${ARC_RESOURCE_NAME}"
+
+# Case-insensitive compare for ARM IDs/UUIDs.
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+#------------------------------------------------------------------------
+# Wait for himds to be ready before we ask it anything. himdsd.service is
+# Type=simple, so After=himdsd doesn't actually guarantee readiness — only
+# that the binary has been exec'd. Poll `azcmagent show -j` until it
+# returns valid JSON, or until the timeout expires (transient JSON parse
+# failures during the himds startup window get retried, not treated as
+# "agent isn't connected — safe to connect").
+#------------------------------------------------------------------------
+existing=""
+existing_resource_id=""
+existing_vmid=""
+ready_timeout=30
+for ((i = 0; i < ready_timeout; i++)); do
+    out="$(azcmagent show -j 2>/dev/null || true)"
+    if [ -z "$out" ]; then
+        # himds not up yet
+        sleep 1
+        continue
+    fi
+    if rid="$(printf '%s' "$out" | jq -re '.resourceId // ""' 2>/dev/null)"; then
+        existing="$out"
+        existing_resource_id="$rid"
+        existing_vmid="$(printf '%s' "$out" | jq -r '.vmId // ""')"
+        break
+    fi
+    # JSON came back malformed — could be a himds startup race; keep polling.
+    sleep 1
+done
+if [ -z "$existing" ]; then
+    log "WARNING: azcmagent show did not return valid JSON within ${ready_timeout}s; proceeding to connect anyway"
+fi
+
+#------------------------------------------------------------------------
+# Idempotency check.
+#   - resourceId AND vmId match: skip connect (already onboarded).
+#   - resourceId mismatch OR vmId mismatch: refuse to clobber.
+#   - both empty: not onboarded, proceed.
+#------------------------------------------------------------------------
+if [ -n "$existing_resource_id" ]; then
+    if [ "$(lower "$existing_resource_id")" = "$(lower "$expected_resource_id")" ] \
+        && [ "$(lower "$existing_vmid")" = "$(lower "$ARC_VMID")" ]; then
+        log "agent already configured for $expected_resource_id (vmId=$ARC_VMID); skipping connect"
+        exit 0
+    fi
+    die_permanent "agent is already configured for $existing_resource_id (vmId=${existing_vmid:-<empty>}), which does not match the requested $expected_resource_id (vmId=$ARC_VMID); refusing to reconfigure. Run 'azcmagent disconnect --force-local-only' or recreate the container with an empty /var/opt/azcmagent volume."
+fi
+
+#------------------------------------------------------------------------
+# MSFT_ARC_TEST: only set if the operator explicitly opts in. Without it,
+# the agent refuses to connect from inside an Azure VM. From plain Docker
+# hosts it isn't needed.
+#------------------------------------------------------------------------
+if [ "${ARC_ALLOW_AZURE_VM_TEST:-false}" = "true" ]; then
+    log "setting MSFT_ARC_TEST=true"
+    export MSFT_ARC_TEST=true
+fi
+
+connect_args=(
+    connect existing
+    --subscription-id "$ARC_SUBSCRIPTION_ID"
+    --resource-group "$ARC_RESOURCE_GROUP"
+    --resource-name "$ARC_RESOURCE_NAME"
+    --location "$ARC_LOCATION"
+    --tenant-id "$ARC_TENANT_ID"
+    --vmid "$ARC_VMID"
+    --cloud "$arc_cloud"
+    --private-key "$arc_private_key"
+)
+[ -n "${ARC_CORRELATION_ID:-}" ] && connect_args+=(--correlation-id "$ARC_CORRELATION_ID")
+
+log "calling azcmagent connect existing for $expected_resource_id"
+azcmagent "${connect_args[@]}"
+log "connect complete"

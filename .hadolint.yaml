@@ -1,0 +1,7 @@
+# hadolint config — see https://github.com/hadolint/hadolint
+
+# DL3008: "pin versions in apt-get install".
+#   We intentionally pull fresh azcmagent and systemd on every rebuild;
+#   pinning would silently fall behind security fixes.
+ignored:
+  - DL3008

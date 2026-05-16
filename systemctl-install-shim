@@ -1,0 +1,16 @@
+#!/bin/sh
+# Build-time-only systemctl replacement.
+#
+# We dpkg-divert the real /usr/bin/systemctl to /usr/bin/systemctl.real
+# during azcmagent's apt install so that postinst's `systemctl start`
+# calls don't fail (no PID 1 systemd at build time). After the install
+# completes, the Dockerfile removes this shim and undoes the diversion,
+# restoring the real systemctl for use at runtime.
+#
+# Returning 0 universally is fine because:
+#   - `start/restart/stop/daemon-reload`: we want no-op during build.
+#   - `enable`: skipped here; the Dockerfile explicitly enables units
+#     itself after restoring the real systemctl.
+#   - `is-active/is-enabled`: rare in postinst paths, and a 0 here just
+#     makes them think the unit is active — harmless during build.
+exit 0
