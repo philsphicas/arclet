@@ -25,3 +25,10 @@ indent_size = unset
 [*.md]
 indent_size = unset
 trim_trailing_whitespace = false
+
+# The dependabot auto-merge workflow uses an embedded JavaScript literal
+# (`script: |`) and column-aligned boolean continuation under `if: >`,
+# both of which break the YAML 2-space rule. The shape mirrors the
+# pattern used in actions/github-script docs, so we exempt this file.
+[.github/workflows/dependabot-auto-merge.yml]
+indent_size = unset

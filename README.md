@@ -75,7 +75,9 @@ arcify --precreate \
   > arc.env
 
 # 2. Add your SSH public key to the env-file
-echo "SSH_AUTHORIZED_KEYS=$(cat ~/.ssh/id_rsa.pub)" >> arc.env
+#    (Skip this step if you only ever want to log in via Entra ID — see
+#    "Entra ID SSH login" below.)
+echo "SSH_AUTHORIZED_KEYS=$(cat ~/.ssh/id_ed25519.pub)" >> arc.env
 
 # 3. Run the container
 docker run -d --name arclet \
@@ -84,13 +86,20 @@ docker run -d --name arclet \
     --env-file arc.env \
     ghcr.io/philsphicas/arclet:dev
 
-# 4. SSH in from anywhere your az is logged in
-ssh root@/subscriptions/<sub>/resourceGroups/my-arclet-rg/providers/Microsoft.HybridCompute/machines/my-host
+# 4. SSH in from anywhere your `az` is logged in
+az ssh arc \
+    --resource-group   my-arclet-rg \
+    --name             my-host \
+    --local-user       root \
+    --private-key-file ~/.ssh/id_ed25519
 ```
 
-The `ssh` invocation works because your `~/.ssh/config` has
-[`aztunnel`](https://github.com/microsoft/azure-relay-bridge-go) (or
-`az ssh arc`) set as a `ProxyCommand` for `Host /subscriptions/*`.
+`az ssh arc` is the default because it works out of the box: it
+discovers the HybridConnectivity endpoint, mints a short-lived cert if
+needed, and tunnels through the Arc relay — no local proxy setup
+required. If you already use [`aztunnel`](https://github.com/microsoft/azure-relay-bridge-go)
+as a `~/.ssh/config` `ProxyCommand`, that works too (see [SSH access
+(how the tunnel works)](#ssh-access-how-the-tunnel-works) below).
 
 Onboarding takes ~30–90 s (network checks + MSI cert retrieval). After
 that, agent heartbeats stay current and the SSH relay route remains
@@ -120,7 +129,7 @@ Images are built `linux/amd64` and `linux/arm64`.
 | Arc tenant ID | `ARC_TENANT_ID` | — |
 | Arc VM ID (UUID stamped on the resource) | `ARC_VMID` | — |
 | Arc private key (base64 PKCS#1 DER) | `ARC_PRIVATE_KEY` | `/run/secrets/arc_private_key`, `/etc/arc-container/private-key` |
-| SSH authorized keys | `SSH_AUTHORIZED_KEYS` | `/run/secrets/ssh_authorized_keys`, `/etc/arc-container/authorized_keys` |
+| SSH authorized keys *(optional if you log in only via Entra ID)* | `SSH_AUTHORIZED_KEYS` | `/run/secrets/ssh_authorized_keys`, `/etc/arc-container/authorized_keys` |
 
 Optional:
 
@@ -173,28 +182,92 @@ host-side `az`, `gh.exe`, `docker.exe`, etc.
 
 ## SSH access (how the tunnel works)
 
-```sh
-# Option A: az ssh arc — Microsoft's CLI for it; creates the
-# HybridConnectivity SSH service config on demand.
-az ssh arc \
-    --resource-group "$ARC_RESOURCE_GROUP" \
-    --name           "$ARC_RESOURCE_NAME" \
-    --local-user     root \
-    --private-key-file ~/.ssh/id_rsa
+`az ssh arc` is the default. It targets the Arc resource by ARM name,
+creates the HybridConnectivity SSH service config on demand, and tunnels
+your local SSH client through the Arc relay:
 
-# Option B: aztunnel arc connect as a ProxyCommand in ~/.ssh/config
-# https://github.com/microsoft/azure-relay-bridge-go
-#
-#   Host /subscriptions/*
-#       ProxyCommand aztunnel arc connect --resource-id %n --port %p
-#       User root
-#
-# then:
+```sh
+az ssh arc \
+    --resource-group   "$ARC_RESOURCE_GROUP" \
+    --name             "$ARC_RESOURCE_NAME" \
+    --local-user       root \
+    --private-key-file ~/.ssh/id_ed25519
+```
+
+If you'd rather use a regular `ssh` client (e.g. for `scp`/`rsync`,
+`ssh -L`, multiplexing, etc.), [`aztunnel`](https://github.com/microsoft/azure-relay-bridge-go)
+gives you a drop-in `ProxyCommand`:
+
+```sshconfig
+Host /subscriptions/*
+    ProxyCommand aztunnel arc connect --resource-id %n --port %p
+    User root
+```
+
+Then:
+
+```sh
 ssh root@/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.HybridCompute/machines/<name>
 ```
 
 First connection through the relay sometimes takes ~30 s for the SSH
 service config to propagate; a second attempt right after succeeds.
+
+## Entra ID SSH login (no local SSH key needed)
+
+Because arclet is a real Arc machine, you can install Microsoft's AAD
+SSH extension on it and then log in with your Entra ID — no SSH key
+exchange, no `SSH_AUTHORIZED_KEYS`. The extension drops a small
+`AuthorizedKeysCommand` helper into sshd that validates an Entra ID
+short-lived cert against the caller's Azure RBAC role on the resource.
+
+One-time per container:
+
+```sh
+# 1. Install the extension on the Arc resource.
+az connectedmachine extension create \
+    --resource-group "$ARC_RESOURCE_GROUP" \
+    --machine-name   "$ARC_RESOURCE_NAME" \
+    --name           AADSSHLoginForLinux \
+    --publisher      Microsoft.Azure.ActiveDirectory \
+    --type           AADSSHLoginForLinux \
+    --auto-upgrade-minor-version true
+
+# 2. Grant yourself (or the principal who will SSH in) a login role.
+#    "Virtual Machine User Login"  → unprivileged shell
+#    "Virtual Machine Administrator Login" → shell + passwordless sudo
+ARC_ID=$(az connectedmachine show \
+    -g "$ARC_RESOURCE_GROUP" -n "$ARC_RESOURCE_NAME" \
+    --query id -o json | jq -r)
+ME=$(az ad signed-in-user show --query id -o json | jq -r)
+az role assignment create \
+    --assignee-object-id "$ME" \
+    --assignee-principal-type User \
+    --role "Virtual Machine Administrator Login" \
+    --scope "$ARC_ID"
+```
+
+Then, from any machine you're `az login`'d on:
+
+```sh
+az ssh arc -g "$ARC_RESOURCE_GROUP" -n "$ARC_RESOURCE_NAME"
+```
+
+No `--local-user`, no `--private-key-file`. The extension auto-creates
+a Linux account for you on first login (username = your UPN), puts you
+in the `aad_admins` group for the admin role (or `aad_users` for the
+user role), and `aad_admins` has passwordless `sudo` via
+`/etc/sudoers.d/aad_admins`.
+
+A few timing caveats:
+
+- The extension install can take a couple of minutes on a freshly-Connected
+  machine; the agent's extension manager polls.
+- `az role assignment create` returns instantly, but ARM data-plane reads
+  may take a handful of seconds to see the new assignment. If the first
+  `az ssh arc` returns a permission error, wait ~10 s and try again.
+- The same "first call sometimes 404s while the SSH service config
+  propagates" caveat from the previous section still applies.
 
 ## Persisting state across container restarts
 
@@ -270,7 +343,7 @@ docker exec arclet tail -f /var/opt/azcmagent/log/himds.log
 | `arc-connect.service` | systemd unit for the above, ordered after `himdsd.service` |
 | `systemctl-install-shim` | Build-time-only no-op `systemctl` used during apt-install of azcmagent |
 | `sshd_config` | Hardened sshd config (key-only auth) |
-| `test-arcify.sh` | End-to-end integration test: builds the image, calls `arcify --precreate`, runs the container, polls for `Connected` |
+| `test-arcify.sh` | End-to-end integration test: builds the image, calls `arcify --precreate`, runs the container, polls for `Connected`, then verifies SSH (own-key, Entra ID, or both) |
 | `.dockerignore` | Build-context filter |
 
 ## Testing
@@ -278,11 +351,21 @@ docker exec arclet tail -f /var/opt/azcmagent/log/himds.log
 `test-arcify.sh` runs the full integration loop against a real Azure
 subscription. It creates a randomly-named resource group, calls
 `arcify --precreate` to mint a fresh Arc resource + payload, runs the
-container, and polls until the agent reports `Connected`.
+container, polls until the agent reports `Connected`, and then verifies
+that SSH actually works through the relay.
 
 ```sh
-# Default: build locally, eastus, keep the RG and container so you can SSH in
+# Default: build locally, eastus, verify own-key SSH (via az ssh arc),
+# keep the RG and container so you can SSH in again later.
 ./test-arcify.sh
+
+# Verify Entra ID SSH login (no local key needed — installs the
+# AADSSHLoginForLinux extension, grants you the admin login role,
+# then attempts `az ssh arc`).
+./test-arcify.sh --mode aad-ssh
+
+# Verify both paths in one container.
+./test-arcify.sh --mode both
 
 # Pull the published image instead of building
 ./test-arcify.sh --pull --image ghcr.io/philsphicas/arclet:dev
@@ -293,7 +376,8 @@ container, and polls until the agent reports `Connected`.
 
 Useful env vars (in addition to flags shown by `--help`):
 
-- `SSH_PUBKEY_FILE` — pubkey to inject (default: `~/.ssh/id_ed25519.pub`, then ecdsa, then rsa)
+- `MODE` — same as `--mode`: `own-key` (default), `aad-ssh`, or `both`
+- `SSH_PUBKEY_FILE` — pubkey to inject (default: `~/.ssh/id_ed25519.pub`, then ecdsa, then rsa). Not used when `MODE=aad-ssh`.
 - `KEEP_CONTAINER=1` — leave the container running at the end (only honored when the Arc resource is also being kept, i.e. `--rg-lifecycle keep`)
 - `KEEP_WORK_DIR=1` — keep the per-run scratch dir (contains the Arc onboarding env-file with the private-key material). Off by default.
 
