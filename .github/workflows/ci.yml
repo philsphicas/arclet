@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: mfinelli/setup-shfmt@v3
+      - uses: mfinelli/setup-shfmt@v4
       - name: shfmt -d
         run: shfmt -d -i 4 -ci -bn .
 
