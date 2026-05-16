@@ -10,7 +10,7 @@
 # Run:    see README.md (requires --tmpfs /tmp /run /run/lock + --privileged,
 #         or equivalent caps, plus cgroup mounts on older Dockers).
 
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
