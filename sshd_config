@@ -1,0 +1,33 @@
+# Minimal hardened sshd config for the container.
+# - Key-based auth only (no passwords, no challenge-response)
+# - Root login allowed only with a key (entrypoint can be configured to run
+#   under a non-root SSH_USER if preferred)
+
+Port 22
+Protocol 2
+
+HostKey /etc/ssh/ssh_host_ed25519_key
+HostKey /etc/ssh/ssh_host_rsa_key
+HostKey /etc/ssh/ssh_host_ecdsa_key
+
+PermitRootLogin prohibit-password
+PasswordAuthentication no
+ChallengeResponseAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+UsePAM yes
+
+# Reduce abuse surface: this is a relay-only SSH endpoint, no need for
+# forwarding. Users who specifically want a forwarder can override.
+AllowTcpForwarding no
+AllowAgentForwarding no
+X11Forwarding no
+GatewayPorts no
+PermitTunnel no
+
+# Forward the agent's environment vars (e.g. PATH from azcmagent) when the
+# user opens a shell.
+AcceptEnv LANG LC_*
+PrintMotd no
+
+Subsystem sftp /usr/lib/openssh/sftp-server

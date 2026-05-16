@@ -1,0 +1,27 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.{yml,yaml}]
+indent_size = 2
+
+[Makefile]
+indent_style = tab
+
+# Continuation lines in Dockerfile RUN steps are conventionally aligned
+# to the previous line's content (e.g. one space before `&&`), not on a
+# 4-space grid, so don't enforce indent here.
+[Dockerfile]
+indent_size = unset
+
+# Markdown contains ASCII tables, indented code blocks, and other
+# content where strict padding rules are inappropriate.
+[*.md]
+indent_size = unset
+trim_trailing_whitespace = false

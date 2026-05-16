@@ -1,0 +1,9 @@
+.git
+.github
+.gitignore
+.editorconfig
+.dockerignore
+LICENSE
+README.md
+test-arcify.sh
+**/*.md

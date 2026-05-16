@@ -1,0 +1,24 @@
+[Unit]
+Description=Onboard machine to Azure Arc (azcmagent connect existing)
+Documentation=https://learn.microsoft.com/azure/azure-arc/servers/
+After=network-online.target himdsd.service
+Wants=network-online.target
+Requires=himdsd.service
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/arc-connect
+StandardOutput=journal
+StandardError=journal
+# Retry once if the first attempt loses against a slow network bring-up.
+Restart=on-failure
+RestartSec=15s
+# Exit code 2 is reserved for permanent failures (e.g. resource mismatch
+# refusal): don't waste restart attempts spamming the same error.
+RestartPreventExitStatus=2
+
+[Install]
+WantedBy=multi-user.target
