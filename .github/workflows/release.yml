@@ -58,7 +58,7 @@ jobs:
 
       - name: Attest provenance
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@v4
         with:
           subject-name: ghcr.io/${{ github.repository }}
           subject-digest: ${{ steps.build.outputs.digest }}
