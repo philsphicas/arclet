@@ -20,15 +20,23 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Keep this matrix in sync with .github/workflows/ci.yml so the
+        # PR gate fails on anything the release would fail on.
         include:
           # AL3 is the default base — owns the unsuffixed tags
-          # (:vX.Y.Z, :latest, :dev).
+          # (:vX.Y.Z, :latest, :dev). amd64-only: Microsoft does not
+          # publish azcmagent for aarch64 in the AL3 repo.
           - base: azl3
             suffix: ""
+            platforms: linux/amd64
           # Ubuntu is the secondary base — its tags get the -ubuntu suffix
-          # (:vX.Y.Z-ubuntu, :latest-ubuntu, :dev-ubuntu).
+          # (:vX.Y.Z-ubuntu, :latest-ubuntu, :dev-ubuntu). Multi-arch:
+          # Microsoft publishes azcmagent for both amd64 and arm64 in
+          # packages.microsoft.com's Ubuntu repo, so this is the variant
+          # for arm64 hosts.
           - base: ubuntu
             suffix: "-ubuntu"
+            platforms: linux/amd64,linux/arm64
     steps:
       - uses: actions/checkout@v6
 
@@ -64,7 +72,7 @@ jobs:
         with:
           context: .
           file: images/${{ matrix.base }}/Dockerfile
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ matrix.platforms }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
