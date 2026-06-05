@@ -107,16 +107,28 @@ live.
 
 ## Image tags
 
+Two base images are published in parallel. **Azure Linux 3** is the
+default — its build is Microsoft's own distro shipping the agent from
+the same package source — and owns the unsuffixed tags. **Ubuntu 24.04**
+is also maintained as a second variant under a `-ubuntu` suffix; use it
+if you have a specific reason to prefer a Debian-family userland.
+
 Published to GHCR:
 
-| Tag | Updated | Notes |
-|---|---|---|
-| `ghcr.io/philsphicas/arclet:dev` | every push to `main` | rolling; expect breakage |
-| `ghcr.io/philsphicas/arclet:latest` | on each `vX.Y.Z` tag | points at the most recent stable release |
-| `ghcr.io/philsphicas/arclet:vX.Y.Z` | on tag | immutable semver pin |
-| `ghcr.io/philsphicas/arclet:vX.Y` | on tag | major.minor floating pin |
+| Tag | Base | Updated | Notes |
+|---|---|---|---|
+| `ghcr.io/philsphicas/arclet:dev` | Azure Linux 3 | every push to `main` | rolling; expect breakage |
+| `ghcr.io/philsphicas/arclet:latest` | Azure Linux 3 | on each `vX.Y.Z` tag | most recent stable release |
+| `ghcr.io/philsphicas/arclet:vX.Y.Z` | Azure Linux 3 | on tag | immutable semver pin |
+| `ghcr.io/philsphicas/arclet:vX.Y` | Azure Linux 3 | on tag | major.minor floating pin |
+| `ghcr.io/philsphicas/arclet:dev-ubuntu` | Ubuntu 24.04 | every push to `main` | rolling; expect breakage |
+| `ghcr.io/philsphicas/arclet:latest-ubuntu` | Ubuntu 24.04 | on each `vX.Y.Z` tag | most recent stable release |
+| `ghcr.io/philsphicas/arclet:vX.Y.Z-ubuntu` | Ubuntu 24.04 | on tag | immutable semver pin |
+| `ghcr.io/philsphicas/arclet:vX.Y-ubuntu` | Ubuntu 24.04 | on tag | major.minor floating pin |
 
-Images are built `linux/amd64` and `linux/arm64`.
+Both variants are built `linux/amd64` and `linux/arm64`, ship the same
+shared scripts (`entrypoint.sh`, `arc-connect`, `arc-connect.service`,
+`sshd_config`), and accept the same `ARC_*` and `SSH_*` inputs.
 
 ## Inputs
 
@@ -337,14 +349,22 @@ docker exec arclet tail -f /var/opt/azcmagent/log/himds.log
 
 | File | Purpose |
 |---|---|
-| `Dockerfile` | Image definition (Ubuntu 24.04 base, systemd as PID 1) |
-| `entrypoint.sh` | Pre-init wrapper: writes config + authorized_keys, then `exec /sbin/init` |
-| `arc-connect` | Onboarding script (run once at boot by `arc-connect.service`) |
-| `arc-connect.service` | systemd unit for the above, ordered after `himdsd.service` |
-| `systemctl-install-shim` | Build-time-only no-op `systemctl` used during apt-install of azcmagent |
-| `sshd_config` | Hardened sshd config (key-only auth) |
+| `images/azl3/Dockerfile` | Image definition for the default Azure Linux 3 variant |
+| `images/ubuntu/Dockerfile` | Image definition for the Ubuntu 24.04 variant |
+| `images/ubuntu/systemctl-install-shim` | Build-time-only no-op `systemctl` used during apt-install of azcmagent on the Ubuntu variant |
+| `entrypoint.sh` | Pre-init wrapper: writes config + authorized_keys, then `exec /sbin/init` (shared across bases) |
+| `arc-connect` | Onboarding script — run once at boot by `arc-connect.service` (shared across bases) |
+| `arc-connect.service` | systemd unit for the above, ordered after `himdsd.service` (shared across bases) |
+| `sshd_config` | Hardened sshd config, key-only auth (shared across bases) |
 | `test-arcify.sh` | End-to-end integration test: builds the image, calls `arcify --precreate`, runs the container, polls for `Connected`, then verifies SSH (own-key, Entra ID, or both) |
 | `.dockerignore` | Build-context filter |
+
+Both Dockerfiles are built with the repository root as the build context:
+
+```sh
+docker build -f images/azl3/Dockerfile   -t arclet:dev .
+docker build -f images/ubuntu/Dockerfile -t arclet:dev-ubuntu .
+```
 
 ## Testing
 
@@ -355,9 +375,12 @@ container, polls until the agent reports `Connected`, and then verifies
 that SSH actually works through the relay.
 
 ```sh
-# Default: build locally, eastus, verify own-key SSH (via az ssh arc),
-# keep the RG and container so you can SSH in again later.
+# Default: build the azl3 image locally, eastus, verify own-key SSH (via
+# az ssh arc), keep the RG and container so you can SSH in again later.
 ./test-arcify.sh
+
+# Test the Ubuntu variant instead
+./test-arcify.sh --base ubuntu
 
 # Verify Entra ID SSH login (no local key needed — installs the
 # AADSSHLoginForLinux extension, grants you the admin login role,
@@ -376,6 +399,7 @@ that SSH actually works through the relay.
 
 Useful env vars (in addition to flags shown by `--help`):
 
+- `BASE` — same as `--base`: `azl3` (default) or `ubuntu`. Selects which `images/<base>/Dockerfile` is built when not using `--pull`.
 - `MODE` — same as `--mode`: `own-key` (default), `aad-ssh`, or `both`
 - `SSH_PUBKEY_FILE` — pubkey to inject (default: `~/.ssh/id_ed25519.pub`, then ecdsa, then rsa). Not used when `MODE=aad-ssh`.
 - `KEEP_CONTAINER=1` — leave the container running at the end (only honored when the Arc resource is also being kept, i.e. `--rg-lifecycle keep`)
