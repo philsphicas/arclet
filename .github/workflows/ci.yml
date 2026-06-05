@@ -77,17 +77,46 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        base: [azl3, ubuntu]
+        # Keep this matrix in sync with release.yml's matrix. The point of
+        # the PR gate is to fail-fast on anything release.yml would fail
+        # on, including per-base arch availability of the agent package.
+        include:
+          - base: azl3
+            platforms: linux/amd64
+          - base: ubuntu
+            platforms: linux/amd64,linux/arm64
     steps:
       - uses: actions/checkout@v6
+      - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
-      - name: Build image (load to local daemon)
+
+      # Build for every platform release.yml will publish to. No load /
+      # push — this is purely a build-time gate. Multi-arch images can't
+      # be loaded into a single-arch Docker daemon, so we can't Trivy-
+      # scan this image; the separate amd64 build below covers that.
+      - name: Build for all release platforms (${{ matrix.platforms }})
         uses: docker/build-push-action@v7
         with:
           context: .
           file: images/${{ matrix.base }}/Dockerfile
+          platforms: ${{ matrix.platforms }}
+          outputs: type=cacheonly
+          cache-from: type=gha,scope=${{ matrix.base }}
+          cache-to: type=gha,scope=${{ matrix.base }},mode=max
+
+      # Amd64-only build with load, for Trivy image scan. With cache-from
+      # the step above, layer reuse makes this near-free in the common
+      # case (and free of cost when matrix.platforms is already amd64-only).
+      - name: Build amd64 for Trivy image scan
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: images/${{ matrix.base }}/Dockerfile
+          platforms: linux/amd64
           load: true
           tags: arclet:ci-${{ matrix.base }}
+          cache-from: type=gha,scope=${{ matrix.base }}
+
       - name: Trivy filesystem scan
         uses: aquasecurity/trivy-action@v0.36.0
         with:

@@ -111,24 +111,26 @@ Two base images are published in parallel. **Azure Linux 3** is the
 default — its build is Microsoft's own distro shipping the agent from
 the same package source — and owns the unsuffixed tags. **Ubuntu 24.04**
 is also maintained as a second variant under a `-ubuntu` suffix; use it
-if you have a specific reason to prefer a Debian-family userland.
+if you have a specific reason to prefer a Debian-family userland, or if
+you need an arm64 image (Microsoft does not ship `azcmagent` for AL3
+aarch64, so the AL3 variant is amd64-only).
 
 Published to GHCR:
 
-| Tag | Base | Updated | Notes |
-|---|---|---|---|
-| `ghcr.io/philsphicas/arclet:dev` | Azure Linux 3 | every push to `main` | rolling; expect breakage |
-| `ghcr.io/philsphicas/arclet:latest` | Azure Linux 3 | on each `vX.Y.Z` tag | most recent stable release |
-| `ghcr.io/philsphicas/arclet:vX.Y.Z` | Azure Linux 3 | on tag | immutable semver pin |
-| `ghcr.io/philsphicas/arclet:vX.Y` | Azure Linux 3 | on tag | major.minor floating pin |
-| `ghcr.io/philsphicas/arclet:dev-ubuntu` | Ubuntu 24.04 | every push to `main` | rolling; expect breakage |
-| `ghcr.io/philsphicas/arclet:latest-ubuntu` | Ubuntu 24.04 | on each `vX.Y.Z` tag | most recent stable release |
-| `ghcr.io/philsphicas/arclet:vX.Y.Z-ubuntu` | Ubuntu 24.04 | on tag | immutable semver pin |
-| `ghcr.io/philsphicas/arclet:vX.Y-ubuntu` | Ubuntu 24.04 | on tag | major.minor floating pin |
+| Tag | Base | Arch | Updated | Notes |
+|---|---|---|---|---|
+| `ghcr.io/philsphicas/arclet:dev` | Azure Linux 3 | amd64 | every push to `main` | rolling; expect breakage |
+| `ghcr.io/philsphicas/arclet:latest` | Azure Linux 3 | amd64 | on each `vX.Y.Z` tag | most recent stable release |
+| `ghcr.io/philsphicas/arclet:vX.Y.Z` | Azure Linux 3 | amd64 | on tag | immutable semver pin |
+| `ghcr.io/philsphicas/arclet:vX.Y` | Azure Linux 3 | amd64 | on tag | major.minor floating pin |
+| `ghcr.io/philsphicas/arclet:dev-ubuntu` | Ubuntu 24.04 | amd64 + arm64 | every push to `main` | rolling; expect breakage |
+| `ghcr.io/philsphicas/arclet:latest-ubuntu` | Ubuntu 24.04 | amd64 + arm64 | on each `vX.Y.Z` tag | most recent stable release |
+| `ghcr.io/philsphicas/arclet:vX.Y.Z-ubuntu` | Ubuntu 24.04 | amd64 + arm64 | on tag | immutable semver pin |
+| `ghcr.io/philsphicas/arclet:vX.Y-ubuntu` | Ubuntu 24.04 | amd64 + arm64 | on tag | major.minor floating pin |
 
-Both variants are built `linux/amd64` and `linux/arm64`, ship the same
-shared scripts (`entrypoint.sh`, `arc-connect`, `arc-connect.service`,
-`sshd_config`), and accept the same `ARC_*` and `SSH_*` inputs.
+Both variants ship the same shared scripts (`entrypoint.sh`,
+`arc-connect`, `arc-connect.service`, `sshd_config`) and accept the same
+`ARC_*` and `SSH_*` inputs.
 
 ## Inputs
 
