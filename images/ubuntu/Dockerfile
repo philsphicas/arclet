@@ -42,7 +42,7 @@ RUN apt-get update \
 #
 # The compound `;` joins (with set -euo pipefail) prevent bash from
 # exec-optimizing into the last command and silently losing PID 1.
-COPY systemctl-install-shim /build-shims/systemctl-install-shim
+COPY images/ubuntu/systemctl-install-shim /build-shims/systemctl-install-shim
 RUN mkdir -p /build-shims \
  && cp /usr/bin/bash /build-shims/systemd \
  && chmod +x /build-shims/systemctl-install-shim \

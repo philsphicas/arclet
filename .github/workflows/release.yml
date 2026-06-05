@@ -15,8 +15,20 @@ permissions:
 
 jobs:
   docker:
-    name: build + publish
+    name: build + publish (${{ matrix.base }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # AL3 is the default base — owns the unsuffixed tags
+          # (:vX.Y.Z, :latest, :dev).
+          - base: azl3
+            suffix: ""
+          # Ubuntu is the secondary base — its tags get the -ubuntu suffix
+          # (:vX.Y.Z-ubuntu, :latest-ubuntu, :dev-ubuntu).
+          - base: ubuntu
+            suffix: "-ubuntu"
     steps:
       - uses: actions/checkout@v6
 
@@ -25,6 +37,8 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ github.repository }}
+          flavor: |
+            suffix=${{ matrix.suffix }},onlatest=true
           tags: |
             type=semver,pattern=v{{version}}
             type=semver,pattern=v{{major}}.{{minor}}
@@ -49,6 +63,7 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
+          file: images/${{ matrix.base }}/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}

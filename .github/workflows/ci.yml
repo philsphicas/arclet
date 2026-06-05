@@ -29,13 +29,17 @@ jobs:
         run: shfmt -d -i 4 -ci -bn .
 
   hadolint:
-    name: hadolint
+    name: hadolint (${{ matrix.base }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        base: [azl3, ubuntu]
     steps:
       - uses: actions/checkout@v6
       - uses: hadolint/hadolint-action@v3.3.0
         with:
-          dockerfile: Dockerfile
+          dockerfile: images/${{ matrix.base }}/Dockerfile
 
   actionlint:
     name: actionlint
@@ -68,8 +72,12 @@ jobs:
           args: detect --source=/github/workspace --no-banner --verbose --redact
 
   build-and-scan:
-    name: build + trivy
+    name: build + trivy (${{ matrix.base }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        base: [azl3, ubuntu]
     steps:
       - uses: actions/checkout@v6
       - uses: docker/setup-buildx-action@v4
@@ -77,8 +85,9 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
+          file: images/${{ matrix.base }}/Dockerfile
           load: true
-          tags: arclet:ci
+          tags: arclet:ci-${{ matrix.base }}
       - name: Trivy filesystem scan
         uses: aquasecurity/trivy-action@v0.36.0
         with:
@@ -90,7 +99,7 @@ jobs:
       - name: Trivy image scan
         uses: aquasecurity/trivy-action@v0.36.0
         with:
-          image-ref: arclet:ci
+          image-ref: arclet:ci-${{ matrix.base }}
           severity: CRITICAL
           ignore-unfixed: true
           exit-code: "1"

@@ -13,7 +13,8 @@
 #
 # Defaults (override via env or flags):
 #   LOCATION=eastus
-#   IMAGE=arclet:dev             (built locally from ./Dockerfile by default)
+#   BASE=azl3                     azl3 | ubuntu — which images/<base>/Dockerfile to build
+#   IMAGE=arclet:dev             (built locally from images/$BASE/Dockerfile by default)
 #   RG_LIFECYCLE=keep            keep | delete-on-success | always-delete
 #   POLL_TIMEOUT=300             seconds to wait for Connected
 #   MODE=own-key                 own-key | aad-ssh | both
@@ -36,6 +37,7 @@ set -euo pipefail
 
 # ---------- config ----------
 LOCATION="${LOCATION:-eastus}"
+BASE="${BASE:-azl3}"
 IMAGE="${IMAGE:-arclet:dev}"
 RG_LIFECYCLE="${RG_LIFECYCLE:-keep}"
 POLL_TIMEOUT="${POLL_TIMEOUT:-300}"
@@ -60,6 +62,7 @@ usage() {
     # editorconfig-checker-disable
     cat <<EOF
 Usage: $0 [--image <image-ref>]
+          [--base <azl3|ubuntu>]
           [--location <azure-region>]
           [--rg-lifecycle <keep|delete-on-success|always-delete>]
           [--mode <own-key|aad-ssh|both>]
@@ -103,6 +106,11 @@ while [ $# -gt 0 ]; do
         --image)
             require_value "$1" "${2:-}"
             IMAGE="$2"
+            shift 2
+            ;;
+        --base)
+            require_value "$1" "${2:-}"
+            BASE="$2"
             shift 2
             ;;
         --location)
@@ -286,8 +294,18 @@ if [ "$PULL" = 1 ]; then
     log "pulling image $IMAGE"
     docker pull "$IMAGE" >/dev/null
 elif [ "$REBUILD" = 1 ] || ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-    log "building $IMAGE from $REPO_ROOT/Dockerfile"
-    docker build -t "$IMAGE" "$REPO_ROOT" >/dev/null
+    # BASE / Dockerfile-on-disk only matter when we actually build. In --pull
+    # mode the local repo layout is irrelevant; the image comes from a registry.
+    case "$BASE" in
+        azl3 | ubuntu) ;;
+        *)
+            die "--base must be azl3|ubuntu (got: $BASE)"
+            ;;
+    esac
+    DOCKERFILE="$REPO_ROOT/images/$BASE/Dockerfile"
+    [ -f "$DOCKERFILE" ] || die "Dockerfile not found at $DOCKERFILE"
+    log "building $IMAGE from $DOCKERFILE"
+    docker build -t "$IMAGE" -f "$DOCKERFILE" "$REPO_ROOT" >/dev/null
 else
     log "image $IMAGE already present (use --rebuild to force, --pull to fetch)"
 fi
