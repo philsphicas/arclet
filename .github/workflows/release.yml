@@ -38,7 +38,7 @@ jobs:
             suffix: "-ubuntu"
             platforms: linux/amd64,linux/arm64
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Docker meta
         id: meta
