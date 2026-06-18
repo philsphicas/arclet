@@ -14,7 +14,7 @@ jobs:
     name: shellcheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ludeeus/action-shellcheck@2.0.0
         env:
           SHELLCHECK_OPTS: -x
@@ -23,7 +23,7 @@ jobs:
     name: shfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: mfinelli/setup-shfmt@v4
       - name: shfmt -d
         run: shfmt -d -i 4 -ci -bn .
@@ -36,7 +36,7 @@ jobs:
       matrix:
         base: [azl3, ubuntu]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: hadolint/hadolint-action@v3.3.0
         with:
           dockerfile: images/${{ matrix.base }}/Dockerfile
@@ -45,21 +45,21 @@ jobs:
     name: actionlint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: raven-actions/actionlint@v2
 
   editorconfig:
     name: editorconfig
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: editorconfig-checker/action-editorconfig-checker@v2
 
   gitleaks:
     name: gitleaks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       # gitleaks-action does a delta scan based on the push event's
@@ -86,7 +86,7 @@ jobs:
           - base: ubuntu
             platforms: linux/amd64,linux/arm64
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
 
