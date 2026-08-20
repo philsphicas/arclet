@@ -1,0 +1,44 @@
+#!/bin/bash
+# Template installed by arclet's arc-extension-handler. The watcher replaces
+# the two @@...@@ values before atomically installing this at an extension's
+# real handler path.
+
+set -uo pipefail
+
+EXT_DIR=@@EXT_DIR@@
+EXT_NAME=@@EXT_NAME@@
+CONFIG_DIR="$EXT_DIR/config"
+STATUS_DIR="$EXT_DIR/status"
+mkdir -p "$CONFIG_DIR" "$STATUS_DIR"
+
+seq=0
+for settings in "$CONFIG_DIR"/*.settings; do
+    [ -e "$settings" ] || continue
+    candidate="${settings##*/}"
+    candidate="${candidate%.settings}"
+    [[ "$candidate" =~ ^[0-9]+$ ]] || continue
+    value=$((10#$candidate))
+    ((value > seq)) && seq=$value
+done
+
+printf 'Enabled' >"$CONFIG_DIR/HandlerState" 2>/dev/null || true
+printf '%s' "$seq" >"$EXT_DIR/mrseq" 2>/dev/null || true
+
+# $* is whatever verb(s) extd invoked us with (e.g. "install", "-enable").
+op="${*:-Enable}"
+ts="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+cat >"$STATUS_DIR/$seq.status" <<EOF
+[
+  {
+    "version": 1.0,
+    "timestampUTC": "$ts",
+    "status": {
+      "name": "$EXT_NAME",
+      "operation": "$op",
+      "status": "success",
+      "code": 0
+    }
+  }
+]
+EOF
+exit 0

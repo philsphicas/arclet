@@ -26,6 +26,7 @@ RUN apt-get update \
         openssh-server \
         ca-certificates curl gnupg lsb-release jq sudo \
         iproute2 procps \
+        inotify-tools \
  && rm -rf /var/lib/apt/lists/*
 
 # Install azcmagent. Two build-time problems to solve:
@@ -115,9 +116,24 @@ COPY arc-connect.service /etc/systemd/system/arc-connect.service
 RUN chmod +x /usr/local/bin/arc-connect \
  && systemctl enable arc-connect.service
 
+# Per-extension handler stubs: watches for extension config pushes and
+# reports success for extensions named in ARC_STUBBED_EXTENSIONS (or a
+# built-in default list of extensions known to be incompatible with arclet,
+# if that env var is unset) without running their real handlers.
+# Always enabled; the watcher always has a list to check (defaults apply
+# when the env var isn't set).
+COPY arc-extension-handler /usr/local/bin/arc-extension-handler
+COPY arc-extension-stub /usr/local/libexec/arc-extension-stub
+COPY arc-extension-handler.service /etc/systemd/system/arc-extension-handler.service
+RUN chmod +x /usr/local/bin/arc-extension-handler \
+ && chmod 0644 /usr/local/libexec/arc-extension-stub \
+ && systemctl enable arc-extension-handler.service
+
 # Entrypoint wrapper materializes runtime config (SSH authorized keys,
-# /etc/arc-connect.env from ARC_* env vars or mounts) BEFORE exec'ing
-# /sbin/init.
+# /etc/arc-connect.env from ARC_* env vars or mounts, and
+# /etc/arc-extension-handler.env from ARC_STUBBED_EXTENSIONS /
+# ARC_STUBBED_EXTENSIONS_EXTRA) BEFORE
+# exec'ing /sbin/init.
 COPY entrypoint.sh /usr/local/bin/entrypoint
 RUN chmod +x /usr/local/bin/entrypoint
 

@@ -154,6 +154,8 @@ Optional:
 | `SSH_USER` | `root` | Non-root: entrypoint creates the account at first boot |
 | `SSH_USER_SUDO` | unset | When set to `1` *and* `SSH_USER` is non-root, grant the user passwordless `sudo`. Off by default — the point of a non-root account is to gate root |
 | `ARC_ALLOW_AZURE_VM_TEST` | unset | Set to `true` to export `MSFT_ARC_TEST=true`. Only needed if the *container host* is itself an Azure VM. See <https://aka.ms/azcmagent-testwarning>. |
+| `ARC_STUBBED_EXTENSIONS` | unset (built-in default list applies) | Comma-separated `<Publisher>.<Type>` extension names whose handlers should be replaced with success-returning stubs. Set to an empty string to disable the built-in list; stubbing is fully disabled only when `ARC_STUBBED_EXTENSIONS_EXTRA` is also unset or empty. See [Blocking specific extensions](#blocking-specific-extensions). |
+| `ARC_STUBBED_EXTENSIONS_EXTRA` | unset | Comma-separated `<Publisher>.<Type>` names to stub *in addition to* whichever list (default or `ARC_STUBBED_EXTENSIONS`) is active. |
 
 ## Where the private key comes from
 
@@ -337,6 +339,130 @@ docker exec arclet journalctl -fu himdsd.service
 docker exec arclet tail -f /var/opt/azcmagent/log/himds.log
 ```
 
+## Blocking specific extensions
+
+Because arclet is a real Arc machine, it's subject to whatever Azure Policy
+assignments apply to its resource group/subscription — including ones that
+auto-install extensions that make no sense for a disposable SSH-relay
+container (monitoring agents, patch management, etc.). You may want some
+extensions to install for real (e.g. `AADSSHLoginForLinux`, see above) while
+suppressing others entirely.
+
+**Supported mechanism first:** the Connected Machine agent has a built-in,
+locally-enforced allow/block list:
+
+```sh
+docker exec arclet azcmagent config set extensions.blocklist \
+    "Microsoft.Azure.Monitor.AzureMonitorLinuxAgent,Microsoft.CPlat.Core.LinuxPatchExtension"
+```
+
+This is real, supported, and survives even an Owner-level attempt to
+reinstall the extension from Azure. The tradeoff: a blocked extension is
+reported to ARM as **failed/blocked**, not "up to date" — it shows up as
+non-compliant, which may itself trigger noise (policy remediation retries,
+compliance alerts) you're trying to avoid.
+
+**`ARC_STUBBED_EXTENSIONS`** takes a different approach for cases where
+you need the extension to report a successful installation. arclet ships
+with a built-in default list of extensions known to be incompatible with
+running inside its disposable container (currently
+`Microsoft.Azure.Monitor.AzureMonitorLinuxAgent`,
+`Microsoft.CPlat.Core.LinuxPatchExtension`, and
+`Microsoft.Azure.Security.Monitoring.AzureSecurityLinuxAgent` — see the
+comments next to `DEFAULT_STUBBED_EXTENSIONS` in `arc-extension-handler` for
+the reasoning behind each), applied automatically when the env var is unset.
+
+To use exactly that default list, don't set anything. To use a different
+list instead of the defaults, set `ARC_STUBBED_EXTENSIONS` to a
+comma-separated list of `<Publisher>.<Type>` names (the same name used in
+the extension's on-disk directory, e.g.
+`Microsoft.Azure.Monitor.AzureMonitorLinuxAgent-1.33.2` →
+`Microsoft.Azure.Monitor.AzureMonitorLinuxAgent`) — this **replaces** the
+defaults, it does not add to them. Set it to an empty string to disable the
+built-in list; this disables stubbing entirely only when
+`ARC_STUBBED_EXTENSIONS_EXTRA` is also unset or empty:
+
+```sh
+docker run -d --name arclet \
+    ... \
+    -e ARC_STUBBED_EXTENSIONS="Microsoft.Azure.Monitor.AzureMonitorLinuxAgent,Microsoft.CPlat.Core.LinuxPatchExtension" \
+    ...
+```
+
+To add extensions on top of whichever list (default or explicit) is active,
+use `ARC_STUBBED_EXTENSIONS_EXTRA` instead:
+
+```sh
+docker run -d --name arclet \
+    ... \
+    -e ARC_STUBBED_EXTENSIONS_EXTRA="Some.Other.Extension" \
+    ...
+```
+
+An extension handler stub service (`arc-extension-handler`, run by
+`arc-extension-handler.service`) uses
+`inotifywait` on `/var/lib/waagent` for extension packages matching those
+names, and replaces the extension's real handler script with a no-op stub
+that reports success, instead of letting the extension's real
+`install`/`enable`/`update` commands run. Extensions not in the active list
+are completely unaffected and install/enable normally.
+
+**How it works:** the Linux Arc extension pipeline unpacks each extension's
+package under `/var/lib/waagent/<Publisher>.<Type>-<Version>/`, including a
+`HandlerManifest.json` that names the script(s) to run for each verb
+(install/uninstall/update/enable/disable — e.g. `handler.sh install` or
+`./shim.sh -install`). `extd` (the extension manager, "EXTMGR" in its logs)
+decides success/failure from **the exit code of that script**, not from any
+status file — so faking a success `status/<seq>.status` while the real
+script still runs and exits non-zero has no effect (verified against a real
+deployment: the status file said success while ARM still recorded
+`FAILED_INSTALL`, because the real exit code was 45).
+
+The watcher establishes a recursive `inotify` monitor before allowing `extd`
+to start and streams filesystem events as they arrive. When
+`HandlerManifest.json` appears, it
+renders a linted static stub template with the known extension directory and
+name, then atomically renames it over every script referenced by the
+manifest's `*Command` entries. The resulting stub determines the current
+sequence number (from `config/*.settings`), writes a success
+`status/<seq>.status` and `HandlerState`/`mrseq` at the extension root (even
+when the handler itself is under a subdirectory), and exits 0 — regardless
+of which verb `extd` invokes it with. Atomic replacement means `extd` sees
+either the complete real handler or the complete stub, never a partially
+written script.
+
+**`extd` can rewrite the package a second time, right before running it.**
+Some extensions (observed with `AzureMonitorLinuxAgent`) get their entire
+package directory re-copied a second time, seconds before the handler is
+actually exec'd — silently clobbering a one-shot stub written earlier at
+unzip time. This is a plain file overwrite (`close_write`), not a `create`
+or `moved_to` event, so a watcher that only reacts to the manifest first
+appearing would miss it and let the real script run once. To handle this,
+the watcher also tracks which script paths it stubbed for each
+extension directory and streams `close_write` events on those specific paths
+for the life of the container, re-applying the stub as soon as each event is
+delivered (with an idempotency check so the watcher's own write doesn't
+trigger itself in a loop). If the monitor fails, the service logs the error,
+exits, and is restarted by systemd rather than silently continuing without
+watches. This was confirmed necessary and
+sufficient in practice: `AzureMonitorLinuxAgent`, `LinuxPatchExtension`,
+and `AzureSecurityLinuxAgent` were all observed being rewritten multiple
+times after the initial stub, and each time the handler stub was correctly
+refreshed; all three ultimately reported `provisioningState: "Succeeded"` in
+ARM.
+
+**This is still inherently a race, not a guarantee.** If `extd` executes the
+handler between rewriting it and the watcher processing the resulting
+`close_write` event, the real script runs once for that invocation. For a
+hard guarantee, pair this with `extensions.blocklist` above: the blocklist
+prevents the extension from ever actually running (accepting a
+failed-looking report on the rare lost race), and
+`ARC_STUBBED_EXTENSIONS` overwrites that report to look successful
+shortly after. Used alone, `ARC_STUBBED_EXTENSIONS` means ARM's
+Activity Log will show a "successful" extension install/enable that never
+actually happened — treat it as a personal convenience shim, not something
+to rely on for compliance reporting.
+
 ## Limitations
 
 - **Private key on the command line.** `azcmagent connect existing` takes
@@ -357,6 +483,9 @@ docker exec arclet tail -f /var/opt/azcmagent/log/himds.log
 | `entrypoint.sh` | Pre-init wrapper: writes config + authorized_keys, then `exec /sbin/init` (shared across bases) |
 | `arc-connect` | Onboarding script — run once at boot by `arc-connect.service` (shared across bases) |
 | `arc-connect.service` | systemd unit for the above, ordered after `himdsd.service` (shared across bases) |
+| `arc-extension-handler` | Watches for extension pushes and fakes success for names in `ARC_STUBBED_EXTENSIONS` (or a built-in default list) (shared across bases); see [Blocking specific extensions](#blocking-specific-extensions) |
+| `arc-extension-stub` | Static, linted handler template rendered and atomically installed by `arc-extension-handler` |
+| `arc-extension-handler.service` | systemd unit for the above, ordered before `extd.service` (shared across bases) |
 | `sshd_config` | Hardened sshd config, key-only auth (shared across bases) |
 | `test-arcify.sh` | End-to-end integration test: builds the image, calls `arcify --precreate`, runs the container, polls for `Connected`, then verifies SSH (own-key, Entra ID, or both) |
 | `.dockerignore` | Build-context filter |

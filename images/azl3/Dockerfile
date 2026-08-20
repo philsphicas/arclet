@@ -60,6 +60,7 @@ RUN mkdir -p /build-shims \
                 ca-certificates curl gnupg jq sudo \
                 iproute procps-ng \
                 shadow-utils \
+                inotify-tools \
                 azcmagent; \
         systemctl enable himdsd.service arcproxyd.service gcad.service extd.service; \
         tdnf clean all; \
@@ -133,9 +134,24 @@ COPY arc-connect.service /etc/systemd/system/arc-connect.service
 RUN chmod +x /usr/local/bin/arc-connect \
  && systemctl enable arc-connect.service
 
+# Per-extension handler stubs: watches for extension config pushes and
+# reports success for extensions named in ARC_STUBBED_EXTENSIONS (or a
+# built-in default list of extensions known to be incompatible with arclet,
+# if that env var is unset) without running their real handlers.
+# Always enabled; the watcher always has a list to check (defaults apply
+# when the env var isn't set).
+COPY arc-extension-handler /usr/local/bin/arc-extension-handler
+COPY arc-extension-stub /usr/local/libexec/arc-extension-stub
+COPY arc-extension-handler.service /etc/systemd/system/arc-extension-handler.service
+RUN chmod +x /usr/local/bin/arc-extension-handler \
+ && chmod 0644 /usr/local/libexec/arc-extension-stub \
+ && systemctl enable arc-extension-handler.service
+
 # Entrypoint wrapper materializes runtime config (SSH authorized keys,
-# /etc/arc-connect.env from ARC_* env vars or mounts) BEFORE exec'ing
-# /sbin/init.
+# /etc/arc-connect.env from ARC_* env vars or mounts, and
+# /etc/arc-extension-handler.env from ARC_STUBBED_EXTENSIONS /
+# ARC_STUBBED_EXTENSIONS_EXTRA) BEFORE
+# exec'ing /sbin/init.
 COPY entrypoint.sh /usr/local/bin/entrypoint
 RUN chmod +x /usr/local/bin/entrypoint
 

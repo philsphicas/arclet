@@ -1,0 +1,5 @@
+# Normalize every text file to LF. This is especially important for scripts
+# copied verbatim into Linux containers and executed via shebang: Windows
+# checkouts with core.autocrlf=true would otherwise produce CRLF and fail with
+# "exec: no such file or directory".
+* text=auto eol=lf

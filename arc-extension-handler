@@ -1,0 +1,447 @@
+#!/bin/bash
+# Watches /var/lib/waagent for extension packages being unpacked and, for any
+# extension whose "<Publisher>.<Type>" name is listed in
+# ARC_STUBBED_EXTENSIONS, replaces its handler command(s) with a no-op
+# stub that reports success without ever running the extension's real
+# install/enable/update/disable/uninstall scripts.
+#
+# Why: some extensions get auto-installed by Azure Policy assignments this
+# machine is subject to, that make no sense to actually run inside this
+# disposable container (AMA, Defender, patch management, ...). Blocking them
+# via `azcmagent config set extensions.blocklist` is the supported mechanism
+# for refusing an extension, but the agent then reports it to ARM as a
+# FAILED/blocked provisioning state.
+#
+# Why not just fake the status file (the original approach)? Tried that
+# first, verified against a real deployment, and it does NOT work: the
+# extension manager (extd, aka "EXTMGR" in its own logs) determines
+# success/failure from the *exit code of the handler process it execs*, not
+# from the status JSON the handler writes — the status file is only relayed
+# to ARM as the "formattedMessage" alongside whatever the exit code decided.
+# Writing a success status file while the real handler still runs and exits
+# non-zero does nothing: extd logs "Install command ... returned with
+# non-zero exit code" and reports FAILED_INSTALL regardless of status file
+# content (confirmed against real AzureSecurityLinuxAgent and
+# AzureMonitorLinuxAgent installs). So the only reliable override is making
+# sure OUR code is what actually runs and exits 0 — i.e. replace the
+# handler script the manifest points at, before extd execs it.
+#
+# How: HandlerManifest.json (which lists the install/uninstall/update/
+# enable/disable commands to run, e.g. "handler.sh install" or
+# "./shim.sh -install") is written to the extension's directory as soon as
+# its package is unzipped — this happens minutes before extd actually
+# dispatches (it downloads+validates+queues every pending extension first).
+# We watch for that file, then for every distinct command word #0 referenced
+# by the manifest (e.g. "handler.sh", "./shim.sh") render a static stub
+# template with the known extension directory/name and atomically rename it
+# over the real script. The stub determines the current sequence number the
+# same way the real handler would (highest-numbered config/*.settings file),
+# writes a success entry to status/<seq>.status, sets HandlerState to Enabled
+# and mrseq to that seq, and exits 0 — regardless of which verb
+# (install/enable/update/disable/uninstall) extd invoked it with.
+#
+# Some extensions (observed with AzureMonitorLinuxAgent) copy their package
+# into /var/lib/waagent a SECOND time, seconds before extd actually execs the
+# handler -- overwriting our stub with the pristine script again. A one-shot
+# stub triggered only by HandlerManifest.json's *first* appearance loses that
+# second race (the gap can be under a second). To handle this, we keep
+# watching the waagent tree and stream every further write to a known handler
+# script path directly to the refresh logic. That immediately re-applies the
+# stub every time, so however many times extd re-copies the package, our stub
+# is what extd execs unless it wins the remaining write-to-exec race.
+# Refreshing an already-stubbed file is a no-op (idempotent), so this is safe
+# to run on every event. Pair with `azcmagent config set
+# extensions.blocklist` for a hard guarantee if that's ever a concern (at the
+# cost of a failed-looking report to ARM if the race is somehow lost).
+#
+# Extensions NOT listed in the resulting stub set are untouched and
+# install/enable normally.
+
+set -uo pipefail
+
+log() { printf '[arc-extension-handler] %s\n' "$*" >&2; }
+
+ENV_FILE="${ENV_FILE:-/etc/arc-extension-handler.env}"
+WAAGENT_DIR="${WAAGENT_DIR:-/var/lib/waagent}"
+STUB_TEMPLATE_FILE="${STUB_TEMPLATE_FILE:-/usr/local/libexec/arc-extension-stub}"
+STUB_TEMPLATE=""
+
+# Extensions known to be incompatible with running inside arclet's disposable
+# container (they either assume a persistent host, need kernel/systemd
+# integration arclet doesn't provide, or exist only to enforce policies that
+# don't make sense for a throwaway SSH relay). Used whenever
+# ARC_STUBBED_EXTENSIONS is not set at all; setting it (even to an empty
+# string) replaces this list entirely rather than adding to it.
+DEFAULT_STUBBED_EXTENSIONS=(
+    # Ships a full Log Analytics/AMA pipeline meant to run persistently and
+    # ship telemetry about the host; pointless for a container that's
+    # recreated on every restart and has nothing worth monitoring.
+    "Microsoft.Azure.Monitor.AzureMonitorLinuxAgent"
+    # Assumes it owns OS patch cadence for a long-lived VM; arclet's image is
+    # rebuilt/redeployed rather than patched in place.
+    "Microsoft.CPlat.Core.LinuxPatchExtension"
+    # Defender for Cloud's Linux agent expects a persistent, individually
+    # monitored host; noisy and irrelevant for a disposable relay container.
+    "Microsoft.Azure.Security.Monitoring.AzureSecurityLinuxAgent"
+)
+
+# Splits a comma-separated "<Publisher>.<Type>" list into a trimmed bash
+# array, appending results to the array named by $1 (nameref).
+split_names() {
+    local -n out="$1"
+    local raw="$2" part
+    local -a parts=()
+    IFS=',' read -ra parts <<<"$raw"
+    for part in "${parts[@]}"; do
+        part="$(printf '%s' "$part" | xargs)"
+        [ -n "$part" ] && out+=("$part")
+    done
+}
+
+check_dependencies() {
+    local cmd missing=0
+    local -a required=(
+        basename cat chmod cmp date inotifywait jq mkdir mkfifo mktemp mv rm
+        sort systemd-notify xargs
+    )
+    for cmd in "${required[@]}"; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            log "required command is missing: $cmd"
+            missing=1
+        fi
+    done
+    [ "$missing" -eq 0 ]
+}
+
+load_config() {
+    unset ARC_STUBBED_EXTENSIONS ARC_STUBBED_EXTENSIONS_EXTRA
+    if [ -f "$ENV_FILE" ]; then
+        # shellcheck disable=SC1090
+        source "$ENV_FILE"
+    fi
+
+    STUBBED_NAMES=()
+    if [ -n "${ARC_STUBBED_EXTENSIONS+set}" ]; then
+        split_names STUBBED_NAMES "$ARC_STUBBED_EXTENSIONS"
+    else
+        STUBBED_NAMES=("${DEFAULT_STUBBED_EXTENSIONS[@]}")
+    fi
+    [ -n "${ARC_STUBBED_EXTENSIONS_EXTRA:-}" ] && split_names STUBBED_NAMES "$ARC_STUBBED_EXTENSIONS_EXTRA"
+
+    log "stubbing handlers for: ${STUBBED_NAMES[*]:-<none>}"
+}
+
+check_dependencies || exit 1
+load_config
+
+load_stub_template() {
+    if [ ! -s "$STUB_TEMPLATE_FILE" ]; then
+        log "stub template is missing or empty: $STUB_TEMPLATE_FILE"
+        return 1
+    fi
+
+    STUB_TEMPLATE="$(<"$STUB_TEMPLATE_FILE")"
+    if [[ "$STUB_TEMPLATE" != *'@@EXT_DIR@@'* ]] \
+        || [[ "$STUB_TEMPLATE" != *'@@EXT_NAME@@'* ]]; then
+        log "stub template is missing required placeholders: $STUB_TEMPLATE_FILE"
+        return 1
+    fi
+}
+
+load_stub_template || exit 1
+
+is_stubbed() {
+    local name="$1" n
+    for n in "${STUBBED_NAMES[@]}"; do
+        [ "$n" = "$name" ] && return 0
+    done
+    return 1
+}
+
+# Extension dirs are named "<Publisher>.<Type>-<Version>", e.g.
+# "Microsoft.Azure.Monitor.AzureMonitorLinuxAgent-1.44.0". Strip the
+# trailing "-<version>" to recover the "<Publisher>.<Type>" name.
+ext_name_from_dir() {
+    printf '%s' "${1%-*}"
+}
+
+render_handler_stub() {
+    local ext_dir="$1" ext_name="$2" quoted_dir quoted_name line
+    printf -v quoted_dir '%q' "$ext_dir"
+    printf -v quoted_name '%q' "$ext_name"
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            'EXT_DIR=@@EXT_DIR@@') printf 'EXT_DIR=%s\n' "$quoted_dir" ;;
+            'EXT_NAME=@@EXT_NAME@@') printf 'EXT_NAME=%s\n' "$quoted_name" ;;
+            *) printf '%s\n' "$line" ;;
+        esac
+    done <<<"$STUB_TEMPLATE"
+}
+
+# Atomically replaces "$ext_dir/$rel_cmd" with a rendered copy of the static
+# stub template. Returns 0 when replaced, 1 when already current, or 2 on an
+# installation error.
+install_handler_stub() {
+    local ext_dir="$1" rel_cmd="$2" ext_name="$3"
+    local target="$ext_dir/$rel_cmd"
+    local target_dir="${target%/*}" temp
+
+    mkdir -p "$target_dir" || {
+        log "failed to create handler directory: $target_dir"
+        return 2
+    }
+    temp="$(mktemp "$target_dir/.arclet-extension-stub.XXXXXX")" || {
+        log "failed to create temporary stub beside: $target"
+        return 2
+    }
+    if ! render_handler_stub "$ext_dir" "$ext_name" >"$temp"; then
+        log "failed to render handler stub: $target"
+        rm -f "$temp"
+        return 2
+    fi
+    if ! chmod 0755 "$temp"; then
+        log "failed to make handler stub executable: $target"
+        rm -f "$temp"
+        return 2
+    fi
+
+    # The exact-content check prevents our moved_to event from causing a
+    # replacement loop. Always replace symlinks and non-executable files.
+    if [ ! -L "$target" ] && [ -x "$target" ] && cmp -s "$temp" "$target"; then
+        rm -f "$temp"
+        return 1
+    fi
+    if ! mv -f -- "$temp" "$target"; then
+        log "failed to atomically install handler stub: $target"
+        rm -f "$temp"
+        return 2
+    fi
+}
+
+# Remembers, per extension directory, which command-script paths we need to
+# keep refreshing, plus a direct full-path index for the event hot path.
+declare -A EXT_CMD_PATHS
+declare -A STUBBED_FILE_DIR
+declare -A STUBBED_FILE_REL_CMD
+declare -A STUBBED_FILE_EXT_NAME
+
+# Reads HandlerManifest.json in $1 (an extension dir) and replaces every
+# distinct command-word #0 referenced by handlerManifest.*Command with a
+# stub. jq -r extracts each *Command string; we only need the first
+# whitespace-separated token (the script/binary path) — extd always appends
+# the verb itself as its own argv (e.g. "handler.sh install") or the token
+# already embeds the verb as a flag (e.g. "./shim.sh -install"); either way,
+# replacing that one script file intercepts every command referencing it.
+stub_manifest() {
+    local ext_dir="$1" ext_name="$2" quiet="${3:-}"
+    local manifest="$ext_dir/HandlerManifest.json"
+    [ -f "$manifest" ] || return 0
+
+    local cmd rel_cmd status paths="" changed=0
+    while IFS= read -r cmd; do
+        [ -n "$cmd" ] || continue
+        IFS=$' \t' read -r rel_cmd _ <<<"$cmd"
+        rel_cmd="${rel_cmd#./}"
+        install_handler_stub "$ext_dir" "$rel_cmd" "$ext_name"
+        status=$?
+        case "$status" in
+            0) changed=1 ;;
+            1) ;;
+            *) return "$status" ;;
+        esac
+        case " $paths " in *" $rel_cmd "*) ;; *) paths="$paths $rel_cmd" ;; esac
+    done < <(jq -r '.[0].handlerManifest // {} | to_entries[] | select(.key | endswith("Command")) | .value' "$manifest" 2>/dev/null | sort -u)
+
+    # A create event can arrive before the manifest has content, and a package
+    # refresh can expose it mid-write. Keep the last known-good path set until
+    # a complete manifest produces at least one command.
+    [ -n "$paths" ] || return 0
+
+    for rel_cmd in ${EXT_CMD_PATHS[$ext_dir]:-}; do
+        unset "STUBBED_FILE_DIR[$ext_dir/$rel_cmd]"
+        unset "STUBBED_FILE_REL_CMD[$ext_dir/$rel_cmd]"
+        unset "STUBBED_FILE_EXT_NAME[$ext_dir/$rel_cmd]"
+    done
+    EXT_CMD_PATHS["$ext_dir"]="$paths"
+    for rel_cmd in $paths; do
+        STUBBED_FILE_DIR["$ext_dir/$rel_cmd"]="$ext_dir"
+        STUBBED_FILE_REL_CMD["$ext_dir/$rel_cmd"]="$rel_cmd"
+        STUBBED_FILE_EXT_NAME["$ext_dir/$rel_cmd"]="$ext_name"
+    done
+    if [ "$changed" -eq 1 ] && [ "$quiet" != "quiet" ]; then
+        log "stubbed handler command(s) for $ext_name in $ext_dir"
+    fi
+}
+
+# extd sometimes re-copies the whole extension package into $WAAGENT_DIR a
+# second time, seconds before it actually execs the handler — overwriting
+# our stub with the pristine script again (observed with AzureMonitorLinuxAgent's
+# shim.sh: written at manifest time, then rewritten again ~1s before exec).
+# That rewrite is an overwrite of an existing file (modify/close_write), not
+# create/moved_to, so it needs its own watch+refresh handler stub, independent of the
+# initial manifest-triggered pass above.
+refresh_handler_stub() {
+    local path="$1" status
+    local ext_dir="${STUBBED_FILE_DIR[$path]:-}"
+    [ -n "$ext_dir" ] || return 0
+
+    install_handler_stub \
+        "$ext_dir" \
+        "${STUBBED_FILE_REL_CMD[$path]}" \
+        "${STUBBED_FILE_EXT_NAME[$path]}"
+    status=$?
+    case "$status" in
+        0) log "refreshed handler stub $path after it was rewritten" ;;
+        1) ;;
+        *) return "$status" ;;
+    esac
+}
+
+stub_extension_dir() {
+    local dir="${1%/}" base ext_name
+    [ -d "$dir" ] || return 0
+    base="$(basename "$dir")"
+    ext_name="$(ext_name_from_dir "$base")"
+    is_stubbed "$ext_name" || return 0
+    stub_manifest "$dir" "$ext_name" "${2:-}"
+}
+
+# Sweep any extension directories that already exist at startup — covers a
+# push that landed before this watcher started (e.g. a restart with a
+# persisted /var/opt/azcmagent volume but a fresh /var/lib/waagent).
+sweep_existing() {
+    [ -d "$WAAGENT_DIR" ] || return 0
+    local dir
+    for dir in "$WAAGENT_DIR"/*/; do
+        stub_extension_dir "$dir" quiet || return
+    done
+}
+
+mkdir -p "$WAAGENT_DIR"
+
+handle_event() {
+    local path="$1" ext_dir base ext_name relative
+    if [ -d "$path" ]; then
+        relative="${path#"$WAAGENT_DIR"/}"
+        relative="${relative%/}"
+        case "$relative" in
+            */*) ;;
+            # A populated extension directory may be moved into place
+            # atomically, producing no event for its existing manifest.
+            *) stub_extension_dir "$path" || return ;;
+        esac
+        return 0
+    fi
+
+    case "$path" in
+        */HandlerManifest.json)
+            ext_dir="${path%/HandlerManifest.json}"
+            base="$(basename "$ext_dir")"
+            ext_name="$(ext_name_from_dir "$base")"
+            if is_stubbed "$ext_name"; then
+                stub_manifest "$ext_dir" "$ext_name"
+            fi
+            ;;
+        *)
+            refresh_handler_stub "$path"
+            ;;
+    esac
+}
+
+WATCH_PID=""
+WATCH_DIR=/run/arc-extension-handler
+
+cleanup_watch() {
+    { exec 3<&-; } 2>/dev/null || true
+    rm -f "$WATCH_DIR/events" "$WATCH_DIR/ready"
+}
+
+stop_watch() {
+    if [ -n "$WATCH_PID" ]; then
+        kill "$WATCH_PID" 2>/dev/null || true
+        wait "$WATCH_PID" 2>/dev/null || true
+        WATCH_PID=""
+    fi
+    cleanup_watch
+}
+
+terminate() {
+    stop_watch
+    exit 0
+}
+
+monitor_inotify_stderr() {
+    local line
+    while IFS= read -r line; do
+        case "$line" in
+            "Watches established.") : >"$WATCH_DIR/ready" ;;
+            "Setting up watches."* | "Watching new directory "*) ;;
+            *) [ -n "$line" ] && log "inotifywait: $line" ;;
+        esac
+    done
+}
+
+watch_forever() {
+    local path status
+
+    rm -f "$WATCH_DIR/events" "$WATCH_DIR/ready"
+    mkfifo "$WATCH_DIR/events" || {
+        log "failed to create watcher event pipe"
+        cleanup_watch
+        return 1
+    }
+
+    # Recursive monitor mode adds watches for newly-created subdirectories.
+    # Events go through a FIFO so the main shell handles each one immediately
+    # and preserves the associative-array indexes updated by handle_event.
+    LC_ALL=C inotifywait -m -r -e create,moved_to,close_write \
+        --format '%w%f' "$WAAGENT_DIR" \
+        >"$WATCH_DIR/events" 2> >(monitor_inotify_stderr) &
+    WATCH_PID=$!
+    exec 3<"$WATCH_DIR/events"
+
+    # Do not let extd start until inotifywait confirms that its initial watch
+    # set is active. Events can accumulate in the FIFO while the startup sweep
+    # catches extension packages that predate the watcher.
+    while [ ! -e "$WATCH_DIR/ready" ]; do
+        if ! kill -0 "$WATCH_PID" 2>/dev/null; then
+            wait "$WATCH_PID"
+            status=$?
+            WATCH_PID=""
+            cleanup_watch
+            [ "$status" -ne 0 ] || status=1
+            return "$status"
+        fi
+        sleep 0.05
+    done
+
+    if ! sweep_existing; then
+        log "failed to stub an existing extension before readiness"
+        stop_watch
+        return 1
+    fi
+    if ! systemd-notify --ready; then
+        log "failed to notify systemd that the watcher is ready"
+        stop_watch
+        return 1
+    fi
+
+    while IFS= read -r path <&3; do
+        if [ -n "$path" ] && ! handle_event "$path"; then
+            log "failed to handle filesystem event: $path"
+            stop_watch
+            return 1
+        fi
+    done
+
+    wait "$WATCH_PID"
+    status=$?
+    WATCH_PID=""
+    cleanup_watch
+    [ "$status" -ne 0 ] && return "$status"
+    log "inotifywait exited unexpectedly"
+    return 1
+}
+
+trap terminate TERM INT
+watch_forever
