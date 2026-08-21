@@ -108,7 +108,26 @@ else
 fi
 
 #------------------------------------------------------------------------
-# 4. Hand off to systemd. From here on, /sbin/init is PID 1.
+# 4. Extension handler stub config (consumed by
+#    /usr/local/bin/arc-extension-handler, run by arc-extension-handler.service).
+#    Only written when ARC_STUBBED_EXTENSIONS and/or ARC_STUBBED_EXTENSIONS_EXTRA
+#    is set; if ARC_STUBBED_EXTENSIONS is unset, the watcher falls back to its
+#    own built-in default list of extensions known to be incompatible with
+#    arclet.
+#------------------------------------------------------------------------
+if [ -n "${ARC_STUBBED_EXTENSIONS+set}" ] || [ -n "${ARC_STUBBED_EXTENSIONS_EXTRA:-}" ]; then
+    log "materializing /etc/arc-extension-handler.env"
+    install -m 0600 /dev/null /etc/arc-extension-handler.env
+    [ -n "${ARC_STUBBED_EXTENSIONS+set}" ] \
+        && printf 'ARC_STUBBED_EXTENSIONS=%q\n' "$ARC_STUBBED_EXTENSIONS" \
+            >>/etc/arc-extension-handler.env
+    [ -n "${ARC_STUBBED_EXTENSIONS_EXTRA:-}" ] \
+        && printf 'ARC_STUBBED_EXTENSIONS_EXTRA=%q\n' "$ARC_STUBBED_EXTENSIONS_EXTRA" \
+            >>/etc/arc-extension-handler.env
+fi
+
+#------------------------------------------------------------------------
+# 5. Hand off to systemd. From here on, /sbin/init is PID 1.
 #------------------------------------------------------------------------
 log "exec'ing $*"
 exec "$@"
